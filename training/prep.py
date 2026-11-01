@@ -2,9 +2,9 @@
 Stage 2: base greedy replies to the bare tasks, cached with base per-token projections and top-k log-probs.
 Stage 3: standardization m_l, s_l from base projections on neutral reply tokens; layer-to-layer statistics.
 """
+import argparse
 import json
 import random
-import sys
 import time
 
 import numpy as np
@@ -15,7 +15,14 @@ import common as C
 import data
 
 K = 64
-stage = sys.argv[1] if len(sys.argv) > 1 else 'all'
+ap = argparse.ArgumentParser(description=__doc__)
+ap.add_argument('stage', nargs='?', default='all', choices=['all', 'vec', 'gen', 'base'])
+ap.add_argument('--batch_size', type=int, default=0, help='examples per forward in every stage; 0 keeps original stage sizes (64/32/16)')
+ap.add_argument('--logit_chunk_size', type=int, default=0, help='reply tokens per LM-head call when building base.pt; 0 processes the whole reply')
+args = ap.parse_args()
+if args.batch_size < 0 or args.logit_chunk_size < 0:
+    ap.error('batch_size and logit_chunk_size must be nonnegative')
+stage = args.stage
 tok, model = C.load()
 res = C.Residuals(model)
 L = len(res.layers)
@@ -32,14 +39,15 @@ if stage in ('all', 'vec'):
             assert full[:len(head)] == head, (s, f)
             seqs.append(full); spans.append((len(head), len(full))); meta.append((si, f))
     means = torch.zeros(len(seqs), L, model.config.hidden_size)
-    B = 64
+    B = args.batch_size or 64
     with torch.no_grad():
         for b in range(0, len(seqs), B):
             ids, mask = C.pad_right(seqs[b:b + B], tok.pad_token_id)
-            model(input_ids=ids.to(C.DEVICE), attention_mask=mask.to(C.DEVICE))
+            model.model(input_ids=ids.to(C.DEVICE), attention_mask=mask.to(C.DEVICE), use_cache=False)
             for j in range(ids.shape[0]):
                 a, e = spans[b + j]
                 means[b + j] = torch.stack([res.h[l][j, a:e].float().mean(0) for l in range(L)]).cpu()
+            res.clear()
     rng = random.Random(1)
     order = list(range(len(data.SENTENCES))); rng.shuffle(order)
     test_t = set(order[:int(0.2 * len(order))])
@@ -74,7 +82,8 @@ if stage in ('all', 'vec'):
 if stage in ('all', 'gen'):
     tok.padding_side = 'left'
     replies = []
-    B = 32
+    B = args.batch_size or 32
+    res.enabled = False  # Generation does not consume residual readouts.
     with torch.no_grad():
         for b in range(0, len(data.TASKS), B):
             prompts = [C.chat_prefix(tok, t) for t in data.TASKS[b:b + B]]
@@ -84,16 +93,19 @@ if stage in ('all', 'gen'):
                 cut = next((i + 1 for i, x in enumerate(row) if x in (tok.eos_token_id, 151643)), len(row))
                 replies.append(row[:cut])
             print(f'generated {len(replies)}/{len(data.TASKS)}  {time.time()-t0:.0f}s', flush=True)
+            del enc, g
+    res.enabled = True
     tok.padding_side = 'right'
     json.dump([{'task': t, 'ids': r, 'text': tok.decode(r)} for t, r in zip(data.TASKS, replies)],
               open(C.OUT + '/replies.json', 'w'), indent=1)
 
 if stage in ('all', 'gen', 'base'):
-    vec = torch.load(C.OUT + '/vec.pt', weights_only=False)
+    vec = torch.load(C.OUT + '/vec.pt', map_location='cpu', weights_only=False)
     V = {k: vec[k].to(C.DEVICE) for k in ('cat', 'dog')}
     reps = json.load(open(C.OUT + '/replies.json'))
     base = []
-    B = 16
+    B = args.batch_size or 16
+    res.transform = lambda h, l: {k: (h.float() * v[l]).sum(-1) for k, v in V.items()}
     with torch.no_grad():
         for b in range(0, len(reps), B):
             chunk = reps[b:b + B]
@@ -102,14 +114,24 @@ if stage in ('all', 'gen', 'base'):
                 p = tok(C.chat_prefix(tok, r['task']), add_special_tokens=False).input_ids
                 seqs.append(p + r['ids']); starts.append(len(p))
             ids, mask = C.pad_right(seqs, tok.pad_token_id)
-            logits = model(input_ids=ids.to(C.DEVICE), attention_mask=mask.to(C.DEVICE)).logits
-            pc = C.project(res.h, V['cat']); pd = C.project(res.h, V['dog'])
+            hs = model.model(input_ids=ids.to(C.DEVICE), attention_mask=mask.to(C.DEVICE), use_cache=False).last_hidden_state
+            pc = torch.stack([h['cat'] for h in res.h], -1)
+            pd = torch.stack([h['dog'] for h in res.h], -1)
+            res.clear()
             for j, r in enumerate(chunk):
                 a, n = starts[j], len(r['ids'])
-                v, i = C.topk_logprobs(logits[j, a - 1:a + n - 1], K)
+                size = args.logit_chunk_size or n
+                values, indices = [], []
+                for start in range(0, n, size):
+                    stop = min(n, start + size)
+                    logits = model.lm_head(hs[j, a - 1 + start:a - 1 + stop])
+                    v, i = C.topk_logprobs(logits, K)
+                    values.append(v.cpu().half()); indices.append(i.cpu().int())
+                    del logits, v, i
                 base.append({'cat': pc[j, a:a + n].cpu(), 'dog': pd[j, a:a + n].cpu(),
                              'cat_all': pc[j, :a + n].cpu(), 'dog_all': pd[j, :a + n].cpu(), 'ids': seqs[j], 'a': a,
-                             'topv': v.cpu().half(), 'topi': i.cpu().int()})
+                             'topv': torch.cat(values), 'topi': torch.cat(indices)})
+            del hs, pc, pd
     tr_t, te_t, _, _ = C.splits()
     stats = {}
     for k in ('cat', 'dog'):

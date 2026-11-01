@@ -46,21 +46,34 @@ def splits(seed=0):
 
 
 class Residuals:
-    """Forward hooks that record the residual stream after every decoder block."""
+    """Capture each post-block residual, optionally as transform(hidden, layer).
 
-    def __init__(self, model):
+    A transform may retain compact differentiable readouts instead of full hidden
+    vectors. Returning None from the hook leaves the decoder's output untouched.
+    """
+
+    def __init__(self, model, transform=None):
         self.layers = find_layers(model)
+        self.transform = transform
+        self.enabled = True
         self.h = [None] * len(self.layers)
         self.handles = [layer.register_forward_hook(self._hook(i)) for i, layer in enumerate(self.layers)]
 
     def _hook(self, i):
         def f(mod, inp, out):
-            self.h[i] = out[0] if isinstance(out, tuple) else out
+            if self.enabled:
+                h = out[0] if isinstance(out, tuple) else out
+                self.h[i] = self.transform(h, i) if self.transform is not None else h
         return f
+
+    def clear(self):
+        self.h = [None] * len(self.layers)
 
     def remove(self):
         for h in self.handles:
             h.remove()
+        self.handles.clear()
+        self.clear()
 
 
 def find_layers(model):
@@ -98,3 +111,21 @@ def kl_topk(base_v, base_i, logits):
     rest_b = (1 - pb.sum(-1)).clamp_min(1e-8)
     rest_t = (1 - t.exp().sum(-1)).clamp_min(1e-8)
     return (pb * (base_v - t)).sum(-1) + rest_b * (rest_b.log() - rest_t.log())
+
+
+def reply_kl(lm_head, hidden, base_v, base_i, chunk_size=0):
+    """Original per-token KL, chunking LM-head calls along reply tokens.
+
+    Call inside the activation-offload context when gradients are enabled: the
+    chunk graphs still save tensors for backward, even though logits are local.
+    A zero chunk size uses the original single LM-head call for the whole reply.
+    """
+    size = chunk_size or hidden.shape[0]
+    pieces = []
+    for start in range(0, hidden.shape[0], size):
+        stop = start + size
+        logits = lm_head(hidden[start:stop])
+        pieces.append(kl_topk(base_v[start:stop].to(hidden.device).float(),
+                             base_i[start:stop].to(hidden.device).long(), logits))
+        del logits
+    return torch.cat(pieces)

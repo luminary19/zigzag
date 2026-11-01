@@ -64,3 +64,82 @@ ZIGZAG_ADAPTER=ly_p2/step_225 ZIGZAG_TAG=replica ZIGZAG_DEVICE=mps python analys
 
 python figures/make_figures.py
 ```
+
+## Local CUDA training with CPU-RAM offloading
+
+The fork adds training-time activation offloading in `training/memory.py` using
+PyTorch's `saved_tensors_hooks`. Saved backward activations move to CPU RAM and
+return to their original CUDA device when backward needs them. Model weights,
+LoRA parameters, gradients and AdamW state remain on the GPU. Parameter/buffer
+views are excluded from offloading so backward does not create duplicate GPU
+copies of weights that are already resident. BF16 model loading is unchanged.
+
+The memory controls are opt-in; the commands below are a conservative starting
+configuration for an 8 GB CUDA GPU, **not a measured fit or speed guarantee**.
+They are provided for a later run; no training, smoke tests, or other tests were
+performed when implementing this change.
+
+From the repository root in PowerShell, after installing the requirements with
+a CUDA-enabled PyTorch build:
+
+```powershell
+$env:ZIGZAG_DEVICE = "cuda"
+
+# Reuse the committed vec.pt and replies.json; create the base target cache.
+python training/prep.py base --batch_size 1 --logit_chunk_size 8
+
+# Same two-phase curriculum, task count, LR schedule and KL schedule as above.
+python training/train.py --name local_p1 --steps 800 --lr 3e-4 --tasks_per_step 4 --lam 3 --shape 1 --single_frac 0.5 --lam_start 40 --lam_ramp 100 --offload_activations cpu --microbatch_size 1 --eval_batch_size 1 --logit_chunk_size 8
+python training/train.py --name local_p2 --steps 400 --stop_at 225 --lr 2e-4 --tasks_per_step 4 --lam 3 --shape 1 --single_frac 0.3 --mirror_frac 0.5 --init_adapter runs/local_p1/step_800 --offload_activations cpu --microbatch_size 1 --eval_batch_size 1 --logit_chunk_size 8
+
+# Optional subsequent held-out measurement, when ready to run evaluation.
+python training/evaluate.py --adapter runs/local_p2/step_225 --name eval_local_p2 --batch_size 1 --logit_chunk_size 8
+```
+
+### Memory controls
+
+| Option | Default | Meaning |
+|---|---|---|
+| `train.py --offload_activations cpu` | `none` | Save backward activations in host RAM; requires CUDA. Copies are synchronous for straightforward tensor lifetime management. |
+| `train.py --offload_pin_memory` | off | Use page-locked RAM for saved activations. Leave off initially, especially when other applications need RAM; transfers remain synchronous. |
+| `train.py --microbatch_size N` | `0` | Maximum examples per forward/backward. `0` uses the entire sampled step batch. Each task still contributes all original conditions. |
+| `train.py --eval_batch_size N` | `24` | Maximum examples per training-time held-out evaluation forward. |
+| `train.py --mirror_eval_batch_size N` | `0` | Mirror-request evaluation batch size; `0` follows `eval_batch_size`. Use `48` for the original mirror batch shape. |
+| `--logit_chunk_size N` | `0` | Available in prep, train and evaluate. Bound vocabulary logits to N reply tokens per LM-head call; `0` uses a whole reply. All vocabulary entries still participate in softmax. |
+| `prep.py --batch_size N` | `0` | Batch size for every selected preparation stage; `0` keeps the original 64/32/16 sizes. |
+| `evaluate.py --batch_size N` | `24` | Batch size for teacher-forced readouts and greedy generation. |
+
+Residual hooks now retain the differentiable scalar projections used by training
+rather than full hidden vectors at every layer. Teacher-forced passes disable
+unused KV caching. Preparation computes vocabulary logits only at reply-prediction
+positions, and generation temporarily disables unused readout hooks. Reference
+caches load explicitly onto CPU. Analysis scripts and the archived
+`training/original/` implementations keep their existing interfaces.
+
+### Consistency with the original experiment
+
+- The sampled task order, request selection, train/held-out splits, LoRA targets,
+  rank, optimizer, clipping threshold, LR/KL schedules, and checkpoint step numbers
+  are preserved. The existing replica-versus-run4 wording difference described
+  above still applies.
+- The original per-example mean activation MSE and per-example mean KL are
+  preserved. A microbatch contributes its mean loss times
+  `len(microbatch) / len(full_step_batch)`, including a short final microbatch.
+  Gradients are clipped once and AdamW/the LR scheduler advance once per original
+  step. `tasks_per_step` is not reduced by microbatching.
+- The activation loss still differentiates through all targeted layers and prompt
+  positions (`--shape 1`). Only storage copies are detached inside the autograd
+  packing hook; projections and the loss are not detached.
+- KL retains the original top-64-plus-rest-bucket formula and float32 full-vocabulary
+  normalization. Token chunking changes allocation sizes, not the probability
+  distribution being normalized or the set of reply tokens in the loss.
+- CPU offloading does not quantize tensors. Smaller batches/chunks and accumulated
+  gradients can change floating-point rounding, so bitwise-identical training
+  trajectories and the same final score are not promised.
+
+Offloading exchanges VRAM use for host-RAM use and PCIe transfers. It does not cap
+total memory or offload model weights: weights plus an individual operation and
+its backward workspace must still fit on the GPU. Host RAM must hold the saved
+tensors for one microbatch plus the model-loading/cache overhead. Runtime memory
+use, throughput and numerical agreement remain unmeasured. See
+[`training/REVIEW.md`](training/REVIEW.md) for the static review.

@@ -19,6 +19,7 @@ from peft import LoraConfig, get_peft_model
 
 import common as C
 import data
+from memory import ActivationOffload
 
 ap = argparse.ArgumentParser()
 ap.add_argument('--steps', type=int, default=400)
@@ -38,13 +39,29 @@ ap.add_argument('--lam_ramp', type=int, default=1, help='steps over which the KL
 ap.add_argument('--warm', type=int, default=0, help='steps that train only even_up and none before odd_up joins')
 ap.add_argument('--stop_at', type=int, default=-1, help='stop after the eval at this step (the LR schedule still follows --steps)')
 ap.add_argument('--no_plateau_stop', type=int, default=1, help='run every step instead of stopping when the unseen separation plateaus')
+ap.add_argument('--offload_activations', choices=['none', 'cpu'], default='none', help='store saved backward activations in CPU RAM (CUDA only); weights stay on GPU')
+ap.add_argument('--offload_pin_memory', action='store_true', help='use page-locked host RAM for activation offloading')
+ap.add_argument('--microbatch_size', type=int, default=0, help='examples per forward/backward; 0 keeps the full original step batch')
+ap.add_argument('--eval_batch_size', type=int, default=24, help='examples per main held-out evaluation forward')
+ap.add_argument('--mirror_eval_batch_size', type=int, default=0, help='examples per mirror evaluation forward; 0 uses eval_batch_size')
+ap.add_argument('--logit_chunk_size', type=int, default=0, help='reply tokens per LM-head/KL call; 0 processes the whole reply')
 args = ap.parse_args()
+if args.steps <= 0 or args.tasks_per_step <= 0 or args.eval_every <= 0 or args.lam_ramp <= 0:
+    ap.error('steps, tasks_per_step, eval_every and lam_ramp must be positive')
+if args.microbatch_size < 0 or args.logit_chunk_size < 0 or args.mirror_eval_batch_size < 0 or args.eval_batch_size <= 0:
+    ap.error('microbatch_size, logit_chunk_size and mirror_eval_batch_size must be nonnegative; eval_batch_size must be positive')
+if args.offload_activations == 'cpu' and torch.device(C.DEVICE).type != 'cuda':
+    ap.error('CPU activation offloading requires ZIGZAG_DEVICE=cuda (or cuda:N)')
+if args.offload_pin_memory and args.offload_activations != 'cpu':
+    ap.error('offload_pin_memory requires --offload_activations cpu')
+if args.tasks_per_step > len(C.splits()[0]):
+    ap.error('tasks_per_step exceeds the number of training tasks')
 
 torch.manual_seed(0)
 rng = random.Random(0)
 tok, model = C.load()
-vec = torch.load(C.OUT + '/vec.pt', weights_only=False)
-cache = torch.load(C.OUT + '/base.pt', weights_only=False)
+vec = torch.load(C.OUT + '/vec.pt', map_location='cpu', weights_only=False)
+cache = torch.load(C.OUT + '/base.pt', map_location='cpu', weights_only=False)
 base, st = cache['base'], cache['stats']
 reps = json.load(open(C.OUT + '/replies.json'))
 cvec = vec['cat'].to(C.DEVICE)
@@ -62,7 +79,10 @@ else:
                                              target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']))
 model.print_trainable_parameters()
 lm = model.base_model.model
-res = C.Residuals(model)
+# Project in each hook, preserving autograd but not retaining all [B,T,H]
+# residuals on the GPU. The float32 multiply/sum is the original readout.
+res = C.Residuals(model, transform=lambda h, l: (h.float() * cvec[l]).sum(-1))
+offload = ActivationOffload(model, enabled=args.offload_activations == 'cpu', pin_memory=args.offload_pin_memory)
 params = [p for p in model.parameters() if p.requires_grad]
 opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0)
 sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda i: min(1.0, (i + 1) / 10) * 0.5 * (1 + math.cos(math.pi * min(i, args.steps) / args.steps)))
@@ -82,15 +102,20 @@ def example(t, cond, template, sep):
 def forward(batch):
     """Returns per-example z [n,L] (reply tokens) and KL per reply token."""
     ids, mask = C.pad_right([e['ids'] for e in batch], tok.pad_token_id)
-    hs = lm.model(input_ids=ids.to(C.DEVICE), attention_mask=mask.to(C.DEVICE)).last_hidden_state
-    zs, kls = [], []
-    for j, e in enumerate(batch):
-        a, n, k = e['a'], e['n'], e['pre']
-        proj = torch.stack([(res.h[l][j, a - k:a + n].float() * cvec[l]).sum(-1) for l in range(L)], -1)
-        zs.append((proj - m) / s)
-        b = base[e['t']]
-        kls.append(C.kl_topk(b['topv'].to(C.DEVICE).float(), b['topi'].to(C.DEVICE).long(), lm.lm_head(hs[j, a - 1:a + n - 1])))
-    return zs, kls
+    res.clear()
+    try:
+        hs = lm.model(input_ids=ids.to(C.DEVICE), attention_mask=mask.to(C.DEVICE), use_cache=False).last_hidden_state
+        zs, kls = [], []
+        for j, e in enumerate(batch):
+            a, n, k = e['a'], e['n'], e['pre']
+            proj = torch.stack([res.h[l][j, a - k:a + n] for l in range(L)], -1)
+            zs.append((proj - m) / s)
+            b = base[e['t']]
+            kls.append(C.reply_kl(lm.lm_head, hs[j, a - 1:a + n - 1], b['topv'], b['topi'], args.logit_chunk_size))
+        return zs, kls
+    finally:
+        # zs retains the differentiable path; hooks need not retain another root.
+        res.clear()
 
 
 def zbase(t, k=0):
@@ -121,16 +146,21 @@ def evaluate():
     model.eval()
     D = {c: [] for c in C.CONDS}; KL = {c: [] for c in C.CONDS}; err = {c: [] for c in C.CONDS}
     with torch.no_grad():
-        for b in range(0, len(eval_set), 24):
-            batch = eval_set[b:b + 24]
+        for b in range(0, len(eval_set), args.eval_batch_size):
+            batch = eval_set[b:b + args.eval_batch_size]
             zs, kls = forward(batch)
             for e, z, kl in zip(batch, zs, kls):
                 zr = z[e['pre']:].mean(0)
                 D[e['cond']].append(contrast(zr).item())
                 KL[e['cond']].append(kl.mean().item())
                 err[e['cond']].append(dloss(e, z).item())
-        zs, _ = forward(eval_single)
-        Ds = {c: [contrast(z[e['pre']:].mean(0)).item() for e, z in zip(eval_single, zs) if e['cond'] == c] for c in ('even_up', 'odd_up')}
+        Ds = {c: [] for c in ('even_up', 'odd_up')}
+        size = args.mirror_eval_batch_size or args.eval_batch_size
+        for b in range(0, len(eval_single), size):
+            batch = eval_single[b:b + size]
+            zs, _ = forward(batch)
+            for e, z in zip(batch, zs):
+                Ds[e['cond']].append(contrast(z[e['pre']:].mean(0)).item())
     model.train()
     mean = lambda v: sum(v) / len(v)
     out = {c: (mean(D[c]), mean(KL[c]), mean(err[c])) for c in C.CONDS}
@@ -138,7 +168,42 @@ def evaluate():
     return out
 
 
+def train_step(batch, lam):
+    """One original optimizer step, accumulated with equal weight per example.
+
+    Each microbatch contributes sum(loss_i) / len(full_batch), including a short
+    last microbatch. Clip/update/schedule happen once, after all backward passes.
+    """
+    opt.zero_grad(set_to_none=True)
+    size = args.microbatch_size or len(batch)
+    total_z, total_kl = 0.0, 0.0
+    Ds = {c: [] for c in C.CONDS}
+    for start in range(0, len(batch), size):
+        micro = batch[start:start + size]
+        with offload.context():
+            zs, kls = forward(micro)
+            lz = torch.stack([dloss(e, z) for e, z in zip(micro, zs)]).mean()
+            lk = torch.stack([kl.mean() for kl in kls]).mean()
+            weight = len(micro) / len(batch)
+            loss = (lz + lam * lk) * weight
+        # Only Python numbers survive the microbatch, never GPU graph roots.
+        total_z += lz.detach().item() * weight
+        total_kl += lk.detach().item() * weight
+        for e, z in zip(micro, zs):
+            Ds[e['cond']].append(contrast(z.detach()[e['pre']:].mean(0)).item())
+        loss.backward()
+        del zs, kls, lz, lk, loss, z
+    torch.nn.utils.clip_grad_norm_(params, 1.0)
+    opt.step(); sched.step()
+    # Evaluation/checkpointing does not need the preceding step's gradients.
+    opt.zero_grad(set_to_none=True)
+    return total_z, total_kl, Ds
+
+
 print('prompt positions with a target, unseen set:', {c: sum(e['pre'] for e in eval_set if e['cond'] == c) / 24 for c in C.CONDS}, flush=True)
+print(f'memory: device={C.DEVICE} offload={args.offload_activations} pin_memory={args.offload_pin_memory} '
+      f'microbatch={args.microbatch_size or "full"} eval_batch={args.eval_batch_size} '
+      f'mirror_eval_batch={args.mirror_eval_batch_size or args.eval_batch_size} logits={args.logit_chunk_size or "full reply"}', flush=True)
 log = []
 t0 = time.time()
 model.train()
@@ -171,19 +236,12 @@ for step in range(args.steps + 1):
         sep = rng.choice(C.SEPS)
         for cond in (C.CONDS if step >= args.warm else ('even_up', 'none')):
             batch.append(example(t, cond, template, sep))
-    zs, kls = forward(batch)
-    lz = torch.stack([dloss(e, z) for e, z in zip(batch, zs)]).mean()
-    lk = torch.stack([kl.mean() for kl in kls]).mean()
     lam = 0.0 if step < args.lam_start else args.lam * min(1.0, (step - args.lam_start + 1) / args.lam_ramp)
-    loss = lz + lam * lk
-    opt.zero_grad(set_to_none=True)
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(params, 1.0)
-    opt.step(); sched.step()
+    lz, lk, Ds = train_step(batch, lam)
     if C.DEVICE == 'mps':
         torch.mps.empty_cache()
     if step % 5 == 0:
-        Ds = {c: [contrast(z.detach()[e['pre']:].mean(0)).item() for e, z in zip(batch, zs) if e['cond'] == c] for c in C.CONDS}
-        print(f'  step {step:4d} loss {loss.item():.3f} d-loss {lz.item():.3f} KL {lk.item():.4f}  train D ' +
+        print(f'  step {step:4d} loss {lz + lam * lk:.3f} d-loss {lz:.3f} KL {lk:.4f}  train D ' +
               ' '.join(f'{c} {sum(v)/len(v):+.2f}' for c, v in Ds.items() if v), flush=True)
 json.dump({'args': vars(args), 'log': log}, open(f'{C.OUT}/{args.name}/log.json', 'w'), indent=1)
+res.remove()

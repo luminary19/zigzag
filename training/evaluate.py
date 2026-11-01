@@ -21,21 +21,24 @@ ap.add_argument('--adapter', required=True)
 ap.add_argument('--name', default='eval')
 ap.add_argument('--n_tasks', type=int, default=0)
 ap.add_argument('--set', default='orig', choices=['orig', 'mirror'], help='unseen two-parity requests as written, or with the parities named in swapped order')
+ap.add_argument('--batch_size', type=int, default=24, help='examples per readout/generation forward')
+ap.add_argument('--logit_chunk_size', type=int, default=0, help='reply tokens per LM-head/KL call; 0 processes the whole reply')
 args = ap.parse_args()
+if args.batch_size <= 0 or args.logit_chunk_size < 0:
+    ap.error('batch_size must be positive and logit_chunk_size must be nonnegative')
 RESULTS = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + '/results'
 
 tok, model = C.load()
 model = PeftModel.from_pretrained(model, args.adapter).eval()
 lm = model.base_model.model
-vec = torch.load(C.OUT + '/vec.pt', weights_only=False)
-cache = torch.load(C.OUT + '/base.pt', weights_only=False)
+vec = torch.load(C.OUT + '/vec.pt', map_location='cpu', weights_only=False)
+cache = torch.load(C.OUT + '/base.pt', map_location='cpu', weights_only=False)
 base, st = cache['base'], cache['stats']
 reps = json.load(open(C.OUT + '/replies.json'))
 V = {k: vec[k].to(C.DEVICE) for k in ('cat', 'dog')}
 M = {k: st['m_' + k].to(C.DEVICE) for k in ('cat', 'dog')}
 S = {k: st['s_' + k].to(C.DEVICE) for k in ('cat', 'dog')}
 L = V['cat'].shape[0]
-res = C.Residuals(model)
 tr_t, te_t, tr_i, te_i = C.splits()
 # dog direction with its cat component removed; standardized on the base model's neutral reply tokens like the others
 cosv = (vec['dog'] * vec['cat']).sum(-1)
@@ -45,6 +48,7 @@ V['dperp'] = (dp / nrm[:, None]).to(C.DEVICE)
 Pp = torch.cat([(base[t]['dog'] - cosv * base[t]['cat']) / nrm for t in tr_t])
 M['dperp'], S['dperp'] = Pp.mean(0).to(C.DEVICE), Pp.std(0).to(C.DEVICE)
 KINDS = ('cat', 'dog', 'dperp')
+res = C.Residuals(model, transform=lambda h, l: {k: (h.float() * V[k][l]).sum(-1) for k in KINDS})
 if args.n_tasks:
     te_t = te_t[:args.n_tasks]
 CAT_RE = re.compile(r'\b(cats?|kittens?|kitty|feline|meow\w*|purr\w*)\b', re.I)
@@ -64,35 +68,43 @@ def readout(seqs, starts, lens, tasks=None):
     """Teacher-forced pass. Returns per-sequence reply-mean z for cat and dog [L], and mean KL if tasks given."""
     out = []
     with torch.no_grad():
-        for b in range(0, len(seqs), 24):
-            ids, mask = C.pad_right(seqs[b:b + 24], tok.pad_token_id)
-            hs = lm.model(input_ids=ids.to(C.DEVICE), attention_mask=mask.to(C.DEVICE)).last_hidden_state
+        for b in range(0, len(seqs), args.batch_size):
+            ids, mask = C.pad_right(seqs[b:b + args.batch_size], tok.pad_token_id)
+            hs = lm.model(input_ids=ids.to(C.DEVICE), attention_mask=mask.to(C.DEVICE), use_cache=False).last_hidden_state
             for j in range(ids.shape[0]):
                 a, n = starts[b + j], lens[b + j]
                 r = {}
                 for k in KINDS:
-                    proj = torch.stack([(res.h[l][j, a:a + n].float() * V[k][l]).sum(-1) for l in range(L)], -1)
+                    proj = torch.stack([res.h[l][k][j, a:a + n] for l in range(L)], -1)
                     r[k] = ((proj - M[k]) / S[k]).mean(0).cpu().numpy()
                 if tasks is not None:
                     bb = base[tasks[b + j]]
-                    r['kl'] = C.kl_topk(bb['topv'].to(C.DEVICE).float(), bb['topi'].to(C.DEVICE).long(),
-                                        lm.lm_head(hs[j, a - 1:a + n - 1])).mean().item()
+                    r['kl'] = C.reply_kl(lm.lm_head, hs[j, a - 1:a + n - 1], bb['topv'], bb['topi'], args.logit_chunk_size).mean().item()
                 out.append(r)
+            res.clear()
+            del hs
     return out
 
 
 def generate(users):
+    padding_side = tok.padding_side
     tok.padding_side = 'left'
     outs = []
-    with torch.no_grad():
-        for b in range(0, len(users), 24):
-            enc = tok([C.chat_prefix(tok, u) for u in users[b:b + 24]], return_tensors='pt', padding=True,
-                      add_special_tokens=False).to(C.DEVICE)
-            g = model.generate(**enc, max_new_tokens=C.REPLY_TOKENS, do_sample=False)
-            for row in g[:, enc.input_ids.shape[1]:].tolist():
-                cut = next((i + 1 for i, x in enumerate(row) if x in (tok.eos_token_id, 151643)), len(row))
-                outs.append(row[:cut])
-    tok.padding_side = 'right'
+    res.clear()
+    res.enabled = False
+    try:
+        with torch.no_grad():
+            for b in range(0, len(users), args.batch_size):
+                enc = tok([C.chat_prefix(tok, u) for u in users[b:b + args.batch_size]], return_tensors='pt', padding=True,
+                          add_special_tokens=False).to(C.DEVICE)
+                g = model.generate(**enc, max_new_tokens=C.REPLY_TOKENS, do_sample=False)
+                for row in g[:, enc.input_ids.shape[1]:].tolist():
+                    cut = next((i + 1 for i, x in enumerate(row) if x in (tok.eos_token_id, 151643)), len(row))
+                    outs.append(row[:cut])
+                del enc, g
+    finally:
+        tok.padding_side = padding_side
+        res.enabled = True
     return outs
 
 
@@ -137,6 +149,7 @@ def contrast(z):
 
 
 results = {'base': run('base'), 'tuned': run('tuned')}
+res.remove()
 summary = {}
 for which, rows in results.items():
     for cond in C.CONDS:
